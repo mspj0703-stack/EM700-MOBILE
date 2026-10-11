@@ -13,6 +13,7 @@ import com.arthenica.ffmpegkit.ReturnCode;
 
 import dev.ffmpegkit_maintained.ytdlp.YtDlp;
 import dev.ffmpegkit_maintained.ytdlp.YtDlpRequest;
+import dev.ffmpegkit_maintained.ytdlp.LogCallback;
 import dev.ffmpegkit_maintained.ytdlp.YtDlpResponse;
 
 import java.io.File;
@@ -23,6 +24,7 @@ import java.util.Comparator;
 import java.util.List;
 import java.util.Locale;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.atomic.AtomicReference;
 
 /** A single worker; only FFmpeg executes asynchronously so statistics can be displayed. */
@@ -111,7 +113,8 @@ public final class WorkEngine {
     private File download(MediaJob job, File workspace) throws Exception {
         progress(job, 0, "yt-dlp 초기화");
         if (!ytdlpReady) {
-            YtDlp.init(context);
+            String updated = YtDlpUpdater.prepare(context);
+            listener.onLog("yt-dlp 엔진: " + updated);
             ytdlpReady = true;
         }
         long available = new StatFs(workspace.getAbsolutePath()).getAvailableBytes();
@@ -126,11 +129,28 @@ public final class WorkEngine {
         else request.addOption("-f", "best[ext=mp4][height<=720]/best[ext=mp4]/best");
         downloadActive = true;
         try {
-            YtDlpResponse result = YtDlp.execute(request, (p, eta, line) -> {
-                int percent = (int)Math.max(0, Math.min(50, p / 2));
-                progress(job, percent, String.format(Locale.ROOT, "다운로드 %.0f%% · ETA %ds", p, eta));
-            });
-            if (!result.isSuccess()) throw new IllegalStateException("다운로드 실패 (" + result.getExitCode() + ")");
+            AtomicReference<String> lastError = new AtomicReference<>("");
+            YtDlpResponse result;
+            try {
+                result = YtDlp.executeDebug(request, (level, line) -> {
+                    if ("ERROR".equals(level)) {
+                        lastError.set(line);
+                        listener.onLog("yt-dlp 오류: " + line);
+                    } else if ("WARNING".equals(level)) {
+                        listener.onLog("yt-dlp 경고: " + line);
+                    }
+                }, (p, eta, line) -> {
+                    int percent = (int)Math.max(0, Math.min(50, p / 2));
+                    progress(job, percent, String.format(Locale.ROOT, "다운로드 %.0f%% · ETA %ds", p, eta));
+                }).get();
+            } catch (ExecutionException ex) {
+                Throwable cause = ex.getCause() != null ? ex.getCause() : ex;
+                throw new IllegalStateException("다운로드 처리 오류: " + cause.getMessage(), cause);
+            }
+            if (!result.isSuccess()) {
+                String reason = lastError.get().isEmpty() ? "상세 원인은 앱 로그 확인" : lastError.get();
+                throw new IllegalStateException("다운로드 실패 (" + result.getExitCode() + "): " + reason);
+            }
         } finally {
             downloadActive = false;
         }
