@@ -24,8 +24,12 @@ import java.util.Comparator;
 import java.util.List;
 import java.util.Locale;
 import java.util.concurrent.CountDownLatch;
+import org.json.JSONObject;
+import org.json.JSONArray;
+import java.util.concurrent.Future;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /** A single worker; only FFmpeg executes asynchronously so statistics can be displayed. */
 public final class WorkEngine {
@@ -58,15 +62,20 @@ public final class WorkEngine {
         if (!workspace.mkdirs()) throw new IllegalStateException("임시 작업 폴더 생성 실패");
         try {
             checkStop();
-            File source = job.isLink() ? download(job, workspace) : importLocal(job, workspace);
+            // YouTube often offers separate video and audio streams only.
+            DownloadedInput downloaded = job.isLink()
+                    ? download(job, workspace)
+                    : new DownloadedInput(importLocal(job, workspace), null);
+            File source = downloaded.main;
             checkStop();
             List<File> outputs;
-            if ("mp4".equals(job.type) && source.getName().toLowerCase(Locale.ROOT).endsWith(".mp4")) {
-                // Downloaded progressive MP4 and local MP4 are preserved bit-for-bit.
+            if ("mp4".equals(job.type) && downloaded.extraAudio == null
+                    && source.getName().toLowerCase(Locale.ROOT).endsWith(".mp4")) {
+                // Copy ordinary MP4 without reencoding; adaptive streams need audio merging.
                 outputs = Arrays.asList(source);
                 progress(job, 72, "MP4 원본 유지");
             } else {
-                outputs = convert(job, source, workspace);
+                outputs = convert(job, source, downloaded.extraAudio, workspace);
             }
             checkStop();
             int index = 0;
@@ -88,7 +97,8 @@ public final class WorkEngine {
         }
     }
     private String buildOutputName(MediaJob job, File output, int index, int count) {
-        String base = job.isLink() ? "download_" + Math.abs(job.url.hashCode()) : job.title;
+        String base = job.isLink() && job.title.equals(job.url)
+                ? "download_" + Integer.toUnsignedString(job.url.hashCode()) : job.title;
         int dot = base.lastIndexOf('.');
         if (dot > 0) base = base.substring(0, dot);
         base = DocumentStorage.safeFileName(base);
@@ -110,64 +120,185 @@ public final class WorkEngine {
         });
         return source;
     }
-    private File download(MediaJob job, File workspace) throws Exception {
+    private static final class DownloadedInput {
+        final File main;
+        final File extraAudio;
+        DownloadedInput(File main, File extraAudio) {
+            this.main = main;
+            this.extraAudio = extraAudio;
+        }
+    }
+
+    private DownloadedInput download(MediaJob job, File workspace) throws Exception {
         progress(job, 0, "yt-dlp 초기화");
+        listener.onLog("EM700 Mobile v0.1.8 · 실시간 형식 조회 후 다운로드");
         if (!ytdlpReady) {
-            String updated = YtDlpUpdater.prepare(context);
-            listener.onLog("yt-dlp 엔진: " + updated);
+            listener.onLog("yt-dlp 엔진: " + YtDlpUpdater.prepare(context));
             ytdlpReady = true;
         }
         long available = new StatFs(workspace.getAbsolutePath()).getAvailableBytes();
-        if (available < 512L * 1024 * 1024) throw new IllegalStateException("저장 공간이 최소 512MB 이상 필요합니다.");
-        YtDlpRequest request = new YtDlpRequest(job.url)
-                .setOutputTemplate(new File(workspace, "source.%(ext)s").getAbsolutePath())
-                .addOption("--no-playlist").addOption("--no-overwrites").addOption("--retries", "8")
-                .addOption("--socket-timeout", "30");
-        // One combined A/V stream: embedded yt-dlp runtime has no separate FFmpeg binary for merging.
-        if ("mp3".equals(job.type)) request.addOption("-f", "bestaudio/best");
-        else if ("avi".equals(job.type)) request.addOption("-f", "best[ext=mp4][height<=360]/best[height<=360]/best");
-        else request.addOption("-f", "best[ext=mp4][height<=720]/best[ext=mp4]/best");
+        if (available < 512L * 1024 * 1024)
+            throw new IllegalStateException("저장 공간이 최소 512MB 이상 필요합니다.");
         downloadActive = true;
         try {
-            AtomicReference<String> lastError = new AtomicReference<>("");
-            YtDlpResponse result;
+            int height = "avi".equals(job.type) ? 360 : 720;
+            listener.onLog("형식 조회 중 · JS/EJS 및 제공 스트림 확인");
+            JSONObject report;
             try {
-                result = YtDlp.executeDebug(request, (level, line) -> {
-                    if ("ERROR".equals(level)) {
-                        lastError.set(line);
-                        listener.onLog("yt-dlp 오류: " + line);
-                    } else if ("WARNING".equals(level)) {
-                        listener.onLog("yt-dlp 경고: " + line);
-                    }
-                }, (p, eta, line) -> {
-                    int percent = (int)Math.max(0, Math.min(50, p / 2));
-                    progress(job, percent, String.format(Locale.ROOT, "다운로드 %.0f%% · ETA %ds", p, eta));
-                }).get();
-            } catch (ExecutionException ex) {
-                Throwable cause = ex.getCause() != null ? ex.getCause() : ex;
-                throw new IllegalStateException("다운로드 처리 오류: " + cause.getMessage(), cause);
+                String raw = com.chaquo.python.Python.getInstance()
+                        .getModule("em700_format_diagnostic")
+                        .callAttr("plan", job.url, height).toString();
+                report = new JSONObject(raw);
+            } catch (Exception ex) {
+                throw new IllegalStateException("영상 형식 조회 실패: " + shortError(ex.getMessage()), ex);
             }
-            if (!result.isSuccess()) {
-                String reason = lastError.get().isEmpty() ? "상세 원인은 앱 로그 확인" : lastError.get();
-                throw new IllegalStateException("다운로드 실패 (" + result.getExitCode() + "): " + reason);
+            listener.onLog("엔진 상태: yt-dlp " + report.optString("yt_dlp") +
+                    " · EJS " + report.optString("ejs") +
+                    " · QuickJS " + report.optString("quickjs"));
+            JSONArray warnings = report.optJSONArray("warnings");
+            if (warnings != null) {
+                for (int i = 0; i < warnings.length(); i++)
+                    listener.onLog("추출 진단: " + warnings.optString(i));
             }
+            JSONObject choices = report.getJSONObject("choices");
+            JSONArray combined = choices.getJSONArray("combined");
+            JSONArray video = choices.getJSONArray("video");
+            JSONArray audio = choices.getJSONArray("audio");
+            listener.onLog("확인된 형식 " + report.optInt("formats_seen") + "개 · " +
+                    "통합 " + combined.length() + " / 영상 " + video.length() + " / 음성 " + audio.length());
+            String reason = report.optString("error");
+            if (!reason.isEmpty()) throw new IllegalStateException("유튜브 형식 조회 오류: " + shortError(reason));
+            if ("mp3".equals(job.type)) {
+                File audioFile = tryCandidates(job, workspace, "source", audio, 0, 50);
+                if (audioFile == null && combined.length() > 0)
+                    audioFile = tryCandidates(job, workspace, "source", combined, 0, 50);
+                if (audioFile == null)
+                    throw new IllegalStateException("다운로드 가능한 음성 형식이 없습니다. 위 추출 진단 로그를 확인하세요.");
+                return new DownloadedInput(audioFile, null);
+            }
+            // Prefer single-file video; otherwise fetch audio and video separately.
+            File direct = tryCandidates(job, workspace, "source", combined, 0, 50);
+            if (direct != null) {
+                listener.onLog("음성 포함 영상 다운로드 완료");
+                return new DownloadedInput(direct, null);
+            }
+            listener.onLog("음성 포함 스트림이 없거나 실패 · 영상/음성 각각 다운로드");
+            File videoFile = tryCandidates(job, workspace, "source_video", video, 0, 28);
+            if (videoFile == null)
+                throw new IllegalStateException("사용할 수 있는 영상 스트림이 없습니다. 형식 목록과 접근 제한을 확인하세요.");
+            File audioFile = tryCandidates(job, workspace, "source_audio", audio, 28, 50);
+            if (audioFile == null)
+                throw new IllegalStateException("영상은 받았지만 음성 스트림이 없습니다. 위 로그를 확인하세요.");
+            listener.onLog("영상/음성 다운로드 성공 · FFmpeg로 병합합니다.");
+            return new DownloadedInput(videoFile, audioFile);
         } finally {
             downloadActive = false;
         }
-        checkStop();
-        File[] found = workspace.listFiles((dir, name) -> name.startsWith("source.") &&
-                !name.endsWith(".part") && !name.endsWith(".ytdl") && !name.endsWith(".temp"));
-        if (found == null || found.length != 1) throw new IllegalStateException("다운로드된 원본 파일을 찾지 못했습니다.");
-        progress(job, 50, "다운로드 완료");
-        return found[0];
     }
-    private List<File> convert(MediaJob job, File source, File workspace) throws Exception {
+
+    private File tryCandidates(MediaJob job, File workspace, String prefix,
+                               JSONArray formats, int from, int to) throws Exception {
+        for (int i = 0; i < formats.length() && i < 3; i++) {
+            checkStop();
+            JSONObject item = formats.getJSONObject(i);
+            String id = item.getString("id");
+            listener.onLog(prefix + " 시도 " + (i + 1) + ": " + id +
+                    " (" + item.optString("ext") + ", " + item.optInt("height") + "p)");
+            try {
+                return downloadTrack(job, workspace, prefix, id, from, to);
+            } catch (InterruptedException stop) {
+                throw stop;
+            } catch (Exception ex) {
+                listener.onLog(prefix + " 다운로드 실패: " + shortError(ex.getMessage()));
+                // A failed attempt must not contaminate the following format attempt.
+                deleteMatching(workspace, prefix + ".");
+                checkStop();
+            }
+        }
+        return null;
+    }
+
+    private static String shortError(String message) {
+        if (message == null || message.isEmpty()) return "상세 오류 없음";
+        return message.length() > 320 ? message.substring(message.length() - 320) : message;
+    }
+
+    private static void deleteMatching(File folder, String prefix) {
+        File[] files = folder.listFiles((d, n) -> n.startsWith(prefix));
+        if (files != null) for (File file : files) if (file.isFile()) file.delete();
+    }
+
+    private void diagnoseFormats(MediaJob job) {
+        listener.onLog("진단: 실제 접근 가능한 영상/음성 형식 확인 중");
+        try {
+            String report = com.chaquo.python.Python.getInstance()
+                    .getModule("em700_format_diagnostic")
+                    .callAttr("describe", job.url).toString();
+            for (String line : report.split("\n")) {
+                if (!line.trim().isEmpty()) listener.onLog("형식 진단: " + shortError(line));
+            }
+        } catch (Exception ex) {
+            listener.onLog("형식 목록 조회 실패: " + shortError(ex.getMessage()));
+        }
+    }
+
+    private File downloadTrack(MediaJob job, File workspace, String prefix, String format,
+                               int fromPercent, int toPercent) throws Exception {
+        checkStop();
+        String target = new File(workspace, prefix + ".%(ext)s").getAbsolutePath();
+        YtDlpRequest request = new YtDlpRequest(job.url)
+                .setOutputTemplate(target)
+                .addOption("--no-playlist")
+                .addOption("-f", format);
+        AtomicReference<String> lastError = new AtomicReference<>("");
+        Future<YtDlpResponse> future = YtDlp.executeDebug(request, (level, line) -> {
+            if ("ERROR".equals(level)) {
+                lastError.set(line);
+                listener.onLog("yt-dlp 오류: " + shortError(line));
+            } else if ("WARNING".equals(level)) {
+                listener.onLog("yt-dlp 경고: " + shortError(line));
+            } else if ("DEBUG".equals(level) && line != null) {
+                String lower = line.toLowerCase(Locale.ROOT);
+                if (lower.contains("challenge") || lower.contains("javascript") ||
+                        lower.contains("quickjs") || lower.contains("format") ||
+                        lower.contains("ejs") || lower.contains("nsig")) {
+                    listener.onLog("yt-dlp 진단: " + shortError(line));
+                }
+            }
+        }, (p, eta, line) -> {
+            int progress = fromPercent + (int) ((toPercent - fromPercent) *
+                    Math.max(0, Math.min(100, p)) / 100.0);
+            progress(job, progress, String.format(Locale.ROOT, "%s %.0f%% · ETA %ds",
+                    prefix.equals("source_audio") ? "음성" : "영상", p, eta));
+        });
+        YtDlpResponse response;
+        try {
+            response = future.get();
+        } catch (ExecutionException ex) {
+            Throwable root = ex.getCause() != null ? ex.getCause() : ex;
+            throw new IllegalStateException(root.getMessage(), root);
+        }
+        if (!response.isSuccess()) {
+            throw new IllegalStateException(lastError.get().isEmpty()
+                    ? "다운로드 실패 (code=" + response.getExitCode() + ")"
+                    : lastError.get());
+        }
+        File[] results = workspace.listFiles((dir, name) -> name.startsWith(prefix + ".") &&
+                !name.endsWith(".part") && !name.endsWith(".ytdl") && !name.endsWith(".temp"));
+        if (results == null || results.length != 1)
+            throw new IllegalStateException("다운로드한 " + prefix + " 파일을 찾지 못했습니다.");
+        progress(job, toPercent, "다운로드 완료: " + prefix);
+        return results[0];
+    }
+    private List<File> convert(MediaJob job, File source, File extraAudio, File workspace) throws Exception {
         int start = job.isLink() ? 50 : 20;
         String ext = "." + job.type;
         String pattern = "avi".equals(job.type) && job.splitMinutes > 0 ? "output_%02d.avi" : "output" + ext;
         File target = new File(workspace, pattern);
         List<String> cmd = ConversionProfile.command(source.getAbsolutePath(), target.getAbsolutePath(),
                 job.type, job.profile, job.splitMinutes);
+        if (extraAudio != null)
+            cmd = ConversionProfile.withExternalAudio(cmd, extraAudio.getAbsolutePath());
         return convertInternal(job, workspace, pattern, cmd, start);
     }
     public void runTest(Uri folder) throws Exception {

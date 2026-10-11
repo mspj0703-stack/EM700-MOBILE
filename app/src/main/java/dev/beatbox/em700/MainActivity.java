@@ -10,6 +10,7 @@ import android.text.InputType;
 import android.view.View;
 import android.view.WindowManager;
 import android.widget.Button;
+import android.widget.CheckBox;
 import android.widget.EditText;
 import android.widget.LinearLayout;
 import android.widget.ProgressBar;
@@ -22,6 +23,7 @@ import android.widget.Toast;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
+import java.util.concurrent.CountDownLatch;
 
 /** On-device download, FFmpeg transcode, and SAF USB export. No broad storage permission. */
 public final class MainActivity extends Activity {
@@ -29,6 +31,7 @@ public final class MainActivity extends Activity {
     private static final int PICK_FOLDER = 102;
     private final List<MediaJob> jobs = new ArrayList<>();
     private Spinner typeSelector, profileSelector, splitSelector;
+    private CheckBox playlistCheck;
     private TextView folderLabel, queueLabel, stateLabel, logLabel;
     private EditText urlField;
     private ProgressBar progressBar;
@@ -43,6 +46,7 @@ public final class MainActivity extends Activity {
         if (!last.isEmpty()) outputTree = Uri.parse(last);
         buildUI();
         refreshQueue();
+        log("EM700 Mobile v0.1.8 · 사용 가능한 형식 자동 선택");
     }
     private LinearLayout vertical() {
         LinearLayout layout = new LinearLayout(this);
@@ -85,6 +89,10 @@ public final class MainActivity extends Activity {
         urlField.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_MULTI_LINE);
         urlField.setHint("https://www.youtube.com/watch?v=...");
         body.addView(urlField, new LinearLayout.LayoutParams(-1, dp(100)));
+        playlistCheck = new CheckBox(this);
+        playlistCheck.setText("재생목록 링크는 모든 영상 변환 (해제하면 단일 영상만)");
+        playlistCheck.setChecked(true);
+        body.addView(playlistCheck);
         body.addView(action("링크를 대기열에 추가", v -> addLinks()));
         body.addView(action("휴대폰 영상/음악 파일 선택 (여러 개 가능)", v -> pickFiles()));
 
@@ -151,8 +159,22 @@ public final class MainActivity extends Activity {
             if (!trimmed.startsWith("https://") && !trimmed.startsWith("http://")) {
                 toast("https:// 링크만 추가할 수 있습니다."); continue;
             }
-            jobs.add(new MediaJob(trimmed, trimmed, null, currentKind(),
-                    profileSelector.getSelectedItemPosition(), currentSplit())); count++;
+            boolean isPlaylistUrl = PlaylistResolver.isPlaylistUrl(trimmed);
+            boolean all = isPlaylistUrl && playlistCheck.isChecked();
+            if (isPlaylistUrl && !all && PlaylistResolver.isPlaylistOnlyUrl(trimmed)) {
+                toast("재생목록 페이지는 '모든 영상 변환'을 체크해 주세요.");
+                continue;
+            }
+            boolean duplicate = false;
+            for (MediaJob existing : jobs) {
+                if (trimmed.equals(existing.url) && existing.status.equals("대기") &&
+                        existing.type.equals(currentKind()) && existing.playlist == all) {
+                    duplicate = true; break;
+                }
+            }
+            if (duplicate) continue;
+            jobs.add(new MediaJob(all ? "[재생목록] " + trimmed : trimmed, trimmed, null, currentKind(),
+                    profileSelector.getSelectedItemPosition(), currentSplit(), all)); count++;
         }
         urlField.setText("");
         log("대기열에 URL " + count + "개 추가"); refreshQueue();
@@ -206,14 +228,51 @@ public final class MainActivity extends Activity {
         for (MediaJob j: jobs) if (j.status.equals("대기")) todo.add(j);
         if (todo.isEmpty()) { toast("대기 중인 영상이 없습니다."); return; }
         startWork(() -> {
-            int done = 0;
-            for (MediaJob j: todo) {
+            int done = 0, failed = 0;
+            int next = 0;
+            while (next < todo.size()) {
                 if (engine.stopped()) break;
+                MediaJob j = todo.get(next++);
                 j.status = "진행 중"; refreshQueueThreadsafe();
+                if (j.playlist) {
+                    try {
+                        logAsync("재생목록 확인 중: " + j.url);
+                        runOnUiThread(() -> stateLabel.setText("재생목록 영상 목록 가져오는 중…"));
+                        List<MediaJob> expanded = PlaylistResolver.resolve(this, j);
+                        if (engine.stopped()) {
+                            j.status = "대기"; refreshQueueThreadsafe(); break;
+                        }
+                        if (expanded.isEmpty()) throw new IllegalStateException("가져올 수 있는 영상이 없습니다.");
+                        // The queue is owned by the UI thread. Insert all resolved entries
+                        // atomically before processing them on this background worker.
+                        CountDownLatch applied = new CountDownLatch(1);
+                        runOnUiThread(() -> {
+                            try {
+                                int index = jobs.indexOf(j);
+                                if (index < 0) index = jobs.size();
+                                else jobs.remove(index);
+                                jobs.addAll(index, expanded);
+                                refreshQueue();
+                            } finally { applied.countDown(); }
+                        });
+                        applied.await();
+                        todo.addAll(next, expanded);
+                        logAsync("재생목록 " + expanded.size() + "개 확인 · 영상별 다운로드/변환 시작");
+                    } catch (InterruptedException e) {
+                        j.status="대기";
+                        Thread.currentThread().interrupt();
+                        refreshQueueThreadsafe();
+                        break;
+                    } catch (Exception e) {
+                        j.status="실패"; failed++;
+                        logAsync("재생목록 조회 실패: " + e.getMessage());
+                        refreshQueueThreadsafe();
+                    }
+                    continue;
+                }
                 try {
                     engine.run(j, outputTree);
-                    j.status="완료";
-                    done++;
+                    j.status="완료"; done++;
                     logAsync("완료: " + j.title);
                 } catch (InterruptedException e) {
                     j.status="대기"; logAsync("작업 중단: " + j.title); break;
@@ -221,12 +280,13 @@ public final class MainActivity extends Activity {
                     if (engine.stopped()) {
                         j.status="대기"; logAsync("작업 중단: " + j.title); break;
                     }
-                    j.status="실패"; logAsync("실패: " + j.title + " → " + e.getMessage());
+                    j.status="실패"; failed++;
+                    logAsync("실패: " + j.title + " → " + e.getMessage());
                 }
                 refreshQueueThreadsafe();
             }
-            final int success = done;
-            runOnUiThread(() -> stateLabel.setText("처리 종료 · 성공 " + success + "개"));
+            final int successCount = done, failCount = failed;
+            runOnUiThread(() -> stateLabel.setText("처리 종료 · 성공 " + successCount + "개 · 실패 " + failCount + "개"));
         });
     }
     private void startTests() {
@@ -296,7 +356,7 @@ public final class MainActivity extends Activity {
     }
     private void log(String s) {
         String t=logLabel.getText().toString() + "\n" + s;
-        logLabel.setText(t.length()>1800 ? t.substring(t.length()-1800) : t);
+        logLabel.setText(t.length()>6500 ? t.substring(t.length()-6500) : t);
     }
     private void logAsync(String s) { runOnUiThread(() -> log(s)); }
     private void toast(String s) { Toast.makeText(this, s, Toast.LENGTH_LONG).show(); }
