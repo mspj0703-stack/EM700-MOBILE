@@ -12,7 +12,10 @@ public final class ConversionProfile {
         "15fps XVID · 320x240 · 모노 (안전 시험)",
         "24fps XVID · 320x240 · 스테레오 (PC 구버전)",
         "15fps DIVX · 160x120 · 모노 (저사양 시험)",
-        "15fps MJPEG · 320x240 · 모노 (대체 시험)"
+        "15fps MJPEG · 320x240 · 모노 (대체 시험)",
+        "14fps XVID · 320x240 · 300kbps (구형 AVI 설정)",
+        "22fps XVID · 320x240 · 400kbps (구형 AVI 설정)",
+        "30fps XVID · 320x240 · 400kbps (MediaManager AVI)"
     };
     private ConversionProfile() {}
 
@@ -30,12 +33,12 @@ public final class ConversionProfile {
             int p = Math.max(0, Math.min(profile, LABELS.length - 1));
             int w = p == 4 ? 160 : 320;
             int h = p == 4 ? 120 : 240;
-            int fps = (p == 0 || p == 1) ? 25 : (p == 3 ? 24 : 15);
+            int fps = p == 6 ? 14 : p == 7 ? 22 : p == 8 ? 30 : ((p == 0 || p == 1) ? 25 : (p == 3 ? 24 : 15));
             String codec = p == 5 ? "mjpeg" : "mpeg4";
             String tag = p == 4 ? "DIVX" : (p == 5 ? "MJPG" : "XVID");
-            String br = p == 1 ? "300k" : (p == 0 ? "400k" : "320k");
-            String rate = (p == 0 || p == 3) ? "44100" : "22050";
-            String channels = (p == 0 || p == 3) ? "2" : "1";
+            String br = (p == 1 || p == 6) ? "300k" : ((p == 0 || p == 7 || p == 8) ? "400k" : "320k");
+            String rate = (p == 0 || p == 3 || p == 8) ? "44100" : "22050";
+            String channels = (p == 0 || p == 3 || p == 8) ? "2" : "1";
             cmd.addAll(Arrays.asList("-map", "0:v:0", "-map", "0:a:0?",
                     "-vf", "scale=" + w + ":" + h + ":force_original_aspect_ratio=decrease," +
                             "pad=" + w + ":" + h + ":(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p",
@@ -47,7 +50,7 @@ public final class ConversionProfile {
             } else {
                 cmd.addAll(Arrays.asList("-q:v", "5"));
             }
-            cmd.addAll(Arrays.asList("-c:a", "libmp3lame", "-b:a", "128k", "-ar", rate,
+            cmd.addAll(Arrays.asList("-c:a", "libmp3lame", "-b:a", (p == 6 ? "64k" : ((p == 7 || p == 8) ? "96k" : "128k")), "-ar", rate,
                     "-ac", channels, "-af", "aresample=async=1:first_pts=0"));
             if (splitMinutes > 0) {
                 int seconds = splitMinutes * 60;
@@ -59,6 +62,27 @@ public final class ConversionProfile {
             throw new IllegalArgumentException("Unknown output type: " + kind);
         }
         cmd.add(dest);
+        return cmd;
+    }
+
+    /** Add a separately downloaded audio input to an output command. Pure Java for testing. */
+    public static List<String> withExternalAudio(List<String> original, String audioPath) {
+        ArrayList<String> cmd = new ArrayList<>(original);
+        int firstInput = cmd.indexOf("-i");
+        if (firstInput < 0 || firstInput + 1 >= cmd.size())
+            throw new IllegalArgumentException("No FFmpeg video input");
+        cmd.add(firstInput + 2, "-i");
+        cmd.add(firstInput + 3, audioPath);
+        boolean audioMapped = false;
+        for (int i = 0; i < cmd.size() - 1; i++) {
+            if ("-map".equals(cmd.get(i)) && "0:a:0?".equals(cmd.get(i + 1))) {
+                cmd.set(i + 1, "1:a:0");
+                audioMapped = true;
+                break;
+            }
+        }
+        if (!audioMapped) throw new IllegalArgumentException("No optional audio stream to replace");
+        cmd.add(cmd.size() - 1, "-shortest");
         return cmd;
     }
 

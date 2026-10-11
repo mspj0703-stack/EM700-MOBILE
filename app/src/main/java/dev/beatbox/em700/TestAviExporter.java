@@ -21,7 +21,7 @@ public final class TestAviExporter {
         void update(int percent, String detail);
     }
 
-    private static final int FILE_COUNT = 6;
+    private static final int FILE_COUNT = 9;
     private TestAviExporter() {}
 
     public static void exportAll(Context context, Uri destination,
@@ -62,7 +62,7 @@ public final class TestAviExporter {
                 if (!tmp.delete()) tmp.deleteOnExit();
             }
         }
-        progress.update(100, "테스트 AVI 6개 저장 완료");
+        progress.update(100, "테스트 AVI 9개 저장 완료");
     }
 
     private static void checkCancelled(BooleanSupplier cancelled) throws InterruptedException {
