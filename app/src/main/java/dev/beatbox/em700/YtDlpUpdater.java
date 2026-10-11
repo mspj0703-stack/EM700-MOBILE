@@ -38,13 +38,14 @@ final class YtDlpUpdater {
         if (marker.isFile()) {
             try (InputStream in = new FileInputStream(marker)) { current = readText(in).trim(); }
         }
-        if (!desired.equals(current) || !new File(active, "yt_dlp/__init__.py").isFile()) {
+        if (!desired.equals(current) || (!new File(active, "yt_dlp/__init__.py").isFile() || !new File(active, "yt_dlp_ejs").isDirectory())) {
             File staging = new File(root, "stage");
             deleteTree(staging);
             if (!staging.mkdirs()) throw new IOException("yt-dlp 임시 폴더 생성 실패");
             try {
                 extract(context, staging);
-                if (!new File(staging, "yt_dlp/__init__.py").isFile()) {
+                if (!new File(staging, "yt_dlp/__init__.py").isFile() ||
+                    !new File(staging, "yt_dlp_ejs").isDirectory()) {
                     throw new IOException("yt-dlp 패키지 내용이 없습니다");
                 }
                 try (FileOutputStream out = new FileOutputStream(new File(staging, ".bundled_version"))) {
@@ -58,13 +59,27 @@ final class YtDlpUpdater {
             }
         }
         Python py = Python.getInstance();
+        // Small Python bridge alters the embedded ytdlp_runner's option conversion.
+        // This is needed because yt-dlp-android 2.0.2 ignores --js-runtimes.
+        File bridge = new File(active, "em700_js_bridge.py");
+        if (!bridge.isFile()) {
+            try (InputStream in = context.getAssets().open("em700_js_bridge.py");
+                 FileOutputStream out = new FileOutputStream(bridge)) {
+                byte[] buf = new byte[8192];
+                int n;
+                while ((n = in.read(buf)) >= 0) out.write(buf, 0, n);
+            }
+        }
         PyObject sysPath = py.getModule("sys").get("path");
         sysPath.callAttr("insert", 0, active.getAbsolutePath());
         String actual = py.getModule("yt_dlp.version").get("__version__").toString();
         if (!desired.equals(actual)) {
             throw new IOException("yt-dlp 업데이트 로드 실패: 원함=" + desired + ", 현재=" + actual);
         }
-        return actual;
+        File qjs = new File(context.getApplicationInfo().nativeLibraryDir, "libqjs.so");
+        if (!qjs.exists()) throw new IOException("QuickJS Android 실행 파일이 APK에 없습니다");
+        py.getModule("em700_js_bridge").callAttr("configure", qjs.getAbsolutePath());
+        return actual + " + QuickJS";
     }
 
     private static void extract(Context context, File to) throws IOException {
@@ -77,7 +92,9 @@ final class YtDlpUpdater {
             long totalSize = 0;
             while ((entry = zin.getNextEntry()) != null) {
                 String name = entry.getName();
-                if (!name.startsWith("yt_dlp/") && !name.matches("yt_dlp-[^/]+\\.dist-info/.*")) {
+                if (!name.startsWith("yt_dlp/") && !name.startsWith("yt_dlp_ejs/") &&
+                    !name.matches("yt_dlp-[^/]+\\.dist-info/.*") &&
+                    !name.matches("yt_dlp_ejs-[^/]+\\.dist-info/.*")) {
                     throw new IOException("예상하지 못한 yt-dlp 패키지 파일: " + name);
                 }
                 File dest = new File(to, name);

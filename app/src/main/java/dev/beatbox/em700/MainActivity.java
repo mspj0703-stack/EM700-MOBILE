@@ -102,7 +102,7 @@ public final class MainActivity extends Activity {
         folderLabel = label(outputTree == null ? "선택 안 됨" : "마지막으로 선택한 폴더: " + outputTree, 12);
         body.addView(folderLabel);
         body.addView(action("저장 폴더 선택 / USB VIDEO 폴더", v -> pickFolder()));
-        body.addView(action("8초 호환성 테스트 AVI 6개 생성", v -> startTests()));
+        body.addView(action("8초 호환성 테스트 AVI 6개 저장 (인코딩 없음)", v -> startTests()));
 
         body.addView(label("④ 대기열", 16));
         queueLabel = label("대기열 비어 있음", 13);
@@ -232,12 +232,28 @@ public final class MainActivity extends Activity {
     private void startTests() {
         if (busy) return;
         if (outputTree == null) { toast("먼저 저장 폴더를 선택하세요."); return; }
+        final Uri selectedFolder = outputTree;
         startWork(() -> {
             try {
-                engine.runTest(outputTree);
+                // Pre-generated, verified AVI samples. No FFmpegKit/native-code execution.
+                TestAviExporter.exportAll(this, selectedFolder,
+                        () -> engine != null && engine.stopped(),
+                        (percent, detail) -> runOnUiThread(() -> {
+                            progressBar.setProgress(percent);
+                            stateLabel.setText(detail);
+                        }));
+                logAsync("호환성 테스트 AVI 6개 저장 완료");
                 runOnUiThread(() -> stateLabel.setText("8초 테스트 AVI 6개 저장 완료"));
+            } catch (InterruptedException | java.util.concurrent.CancellationException e) {
+                logAsync("테스트 파일 저장 중단됨");
+                runOnUiThread(() -> stateLabel.setText("테스트 저장 중단됨"));
             } catch (Exception e) {
-                logAsync("테스트 파일 제작 실패: " + e.getMessage());
+                final String reason = e.getClass().getSimpleName() + ": " + e.getMessage();
+                logAsync("테스트 파일 저장 실패: " + reason);
+                runOnUiThread(() -> {
+                    stateLabel.setText("저장 실패: " + reason);
+                    toast("테스트 저장 실패. 아래 오류 로그를 확인하세요.");
+                });
             }
         });
     }
