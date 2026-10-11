@@ -5,6 +5,13 @@ import android.content.Intent;
 import android.graphics.Color;
 import android.net.Uri;
 import android.os.Bundle;
+import android.os.Build;
+import android.os.Handler;
+import android.os.Looper;
+import android.Manifest;
+import android.content.pm.PackageManager;
+import org.json.JSONObject;
+import org.json.JSONArray;
 import android.provider.DocumentsContract;
 import android.text.InputType;
 import android.view.View;
@@ -39,6 +46,15 @@ public final class MainActivity extends Activity {
     private Uri outputTree;
     private volatile WorkEngine engine;
     private volatile boolean busy;
+    private final Handler uiHandler = new Handler(Looper.getMainLooper());
+    private final Runnable serviceUi = new Runnable() {
+        @Override public void run() {
+            updateFromService();
+            uiHandler.postDelayed(this, 650);
+        }
+    };
+    private String lastServiceLog = "";
+    private boolean appliedCompletedQueue;
 
     @Override protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
@@ -46,8 +62,60 @@ public final class MainActivity extends Activity {
         if (!last.isEmpty()) outputTree = Uri.parse(last);
         buildUI();
         refreshQueue();
-        log("EM700 Mobile v0.1.8 · 사용 가능한 형식 자동 선택");
+        log("EM700 Mobile v0.1.9 · 백그라운드 다운로드/변환");
+        if (Build.VERSION.SDK_INT >= 33 &&
+                checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(new String[] { Manifest.permission.POST_NOTIFICATIONS }, 140);
+        }
     }
+    @Override protected void onResume() {
+        super.onResume();
+        uiHandler.removeCallbacks(serviceUi);
+        uiHandler.post(serviceUi);
+    }
+    @Override protected void onPause() {
+        uiHandler.removeCallbacks(serviceUi);
+        super.onPause();
+    }
+    private void updateFromService() {
+        ConversionService.Snapshot state = ConversionService.snapshot();
+        if (state == null) return;
+        boolean serviceBusy = state.running;
+        if (!busy) {
+            startButton.setEnabled(!serviceBusy);
+            stopButton.setEnabled(serviceBusy);
+            progressBar.setProgress(state.percent);
+            stateLabel.setText(state.status);
+        }
+        if (state.log != null && !state.log.equals(lastServiceLog)) {
+            lastServiceLog = state.log;
+            logLabel.setText(state.log);
+        }
+        // The service owns the live queue. Rebuild display from its snapshot, not
+        // from Activity-local mutable objects that can disappear on rotation.
+        if (state.jobs != null && !state.jobs.isEmpty()) {
+            if (!state.running && !busy) {
+                if (!appliedCompletedQueue) {
+                    jobs.clear();
+                    jobs.addAll(state.jobs);
+                    appliedCompletedQueue = true;
+                }
+                refreshQueue();
+            } else if (state.running) {
+                appliedCompletedQueue = false;
+                StringBuilder text = new StringBuilder();
+                int i = 0;
+                for (MediaJob job : state.jobs) {
+                    String title = job.title.length() > 80 ? job.title.substring(0, 80) + "…" : job.title;
+                    text.append(++i).append(". ").append(title).append("\n   ")
+                            .append(job.type.toUpperCase(Locale.ROOT)).append(" · ")
+                            .append(job.status).append(" ").append(job.percent).append("%\n");
+                }
+                queueLabel.setText(text.toString());
+            }
+        }
+    }
+    private boolean conversionRunning() { return ConversionService.isRunning(); }
     private LinearLayout vertical() {
         LinearLayout layout = new LinearLayout(this);
         layout.setOrientation(LinearLayout.VERTICAL);
@@ -116,7 +184,7 @@ public final class MainActivity extends Activity {
         queueLabel = label("대기열 비어 있음", 13);
         body.addView(queueLabel);
         body.addView(action("완료/실패 항목 정리", v -> {
-            if (busy) return;
+            if (busy || conversionRunning()) return;
             jobs.removeIf(j -> !j.status.equals("대기")); refreshQueue();
         }));
 
@@ -124,9 +192,13 @@ public final class MainActivity extends Activity {
         buttons.setOrientation(LinearLayout.HORIZONTAL);
         startButton = action("▶ 변환 시작", v -> startJobs());
         stopButton = action("■ 중단", v -> {
-            WorkEngine w = engine;
-            if (w != null) w.requestStop();
-            stateLabel.setText("중단 요청됨 · 진행 중 다운로드는 완료 후 중단");
+            if (conversionRunning()) {
+                startService(new Intent(this, ConversionService.class).setAction(ConversionService.ACTION_STOP));
+            } else {
+                WorkEngine w = engine;
+                if (w != null) w.requestStop();
+            }
+            stateLabel.setText("중단 요청됨 · 현재 다운로드는 완료 후 중단될 수 있음");
         });
         buttons.addView(startButton, new LinearLayout.LayoutParams(0, dp(55), 1));
         buttons.addView(stopButton, new LinearLayout.LayoutParams(0, dp(55), 1));
@@ -152,6 +224,7 @@ public final class MainActivity extends Activity {
         }
     }
     private void addLinks() {
+        if (conversionRunning()) { toast("작업 완료 후 새 대기열을 추가하세요."); return; }
         String raw = urlField.getText().toString(); int count=0;
         for (String part : raw.split("\\s+")) {
             String trimmed=part.trim();
@@ -180,6 +253,7 @@ public final class MainActivity extends Activity {
         log("대기열에 URL " + count + "개 추가"); refreshQueue();
     }
     private void pickFiles() {
+        if (conversionRunning()) { toast("작업 완료 후 파일을 추가하세요."); return; }
         Intent i = new Intent(Intent.ACTION_OPEN_DOCUMENT);
         i.addCategory(Intent.CATEGORY_OPENABLE); i.setType("*/*");
         i.putExtra(Intent.EXTRA_MIME_TYPES, new String[] {"video/*", "audio/*", "application/octet-stream"});
@@ -222,75 +296,42 @@ public final class MainActivity extends Activity {
         }
     }
     private void startJobs() {
-        if (busy) return;
+        if (busy || conversionRunning()) return;
         if (outputTree == null) { toast("먼저 저장 폴더를 선택하세요."); return; }
-        List<MediaJob> todo=new ArrayList<>();
-        for (MediaJob j: jobs) if (j.status.equals("대기")) todo.add(j);
-        if (todo.isEmpty()) { toast("대기 중인 영상이 없습니다."); return; }
-        startWork(() -> {
-            int done = 0, failed = 0;
-            int next = 0;
-            while (next < todo.size()) {
-                if (engine.stopped()) break;
-                MediaJob j = todo.get(next++);
-                j.status = "진행 중"; refreshQueueThreadsafe();
-                if (j.playlist) {
-                    try {
-                        logAsync("재생목록 확인 중: " + j.url);
-                        runOnUiThread(() -> stateLabel.setText("재생목록 영상 목록 가져오는 중…"));
-                        List<MediaJob> expanded = PlaylistResolver.resolve(this, j);
-                        if (engine.stopped()) {
-                            j.status = "대기"; refreshQueueThreadsafe(); break;
-                        }
-                        if (expanded.isEmpty()) throw new IllegalStateException("가져올 수 있는 영상이 없습니다.");
-                        // The queue is owned by the UI thread. Insert all resolved entries
-                        // atomically before processing them on this background worker.
-                        CountDownLatch applied = new CountDownLatch(1);
-                        runOnUiThread(() -> {
-                            try {
-                                int index = jobs.indexOf(j);
-                                if (index < 0) index = jobs.size();
-                                else jobs.remove(index);
-                                jobs.addAll(index, expanded);
-                                refreshQueue();
-                            } finally { applied.countDown(); }
-                        });
-                        applied.await();
-                        todo.addAll(next, expanded);
-                        logAsync("재생목록 " + expanded.size() + "개 확인 · 영상별 다운로드/변환 시작");
-                    } catch (InterruptedException e) {
-                        j.status="대기";
-                        Thread.currentThread().interrupt();
-                        refreshQueueThreadsafe();
-                        break;
-                    } catch (Exception e) {
-                        j.status="실패"; failed++;
-                        logAsync("재생목록 조회 실패: " + e.getMessage());
-                        refreshQueueThreadsafe();
-                    }
-                    continue;
-                }
-                try {
-                    engine.run(j, outputTree);
-                    j.status="완료"; done++;
-                    logAsync("완료: " + j.title);
-                } catch (InterruptedException e) {
-                    j.status="대기"; logAsync("작업 중단: " + j.title); break;
-                } catch (Exception e) {
-                    if (engine.stopped()) {
-                        j.status="대기"; logAsync("작업 중단: " + j.title); break;
-                    }
-                    j.status="실패"; failed++;
-                    logAsync("실패: " + j.title + " → " + e.getMessage());
-                }
-                refreshQueueThreadsafe();
+        JSONArray queue = new JSONArray();
+        try {
+            for (MediaJob job : jobs) {
+                if (!"대기".equals(job.status)) continue;
+                JSONObject entry = new JSONObject();
+                entry.put("title", job.title);
+                entry.put("url", job.url == null ? "" : job.url);
+                entry.put("localUri", job.localUri == null ? "" : job.localUri.toString());
+                entry.put("type", job.type);
+                entry.put("profile", job.profile);
+                entry.put("splitMinutes", job.splitMinutes);
+                entry.put("playlist", job.playlist);
+                queue.put(entry);
             }
-            final int successCount = done, failCount = failed;
-            runOnUiThread(() -> stateLabel.setText("처리 종료 · 성공 " + successCount + "개 · 실패 " + failCount + "개"));
-        });
+        } catch (Exception ex) {
+            toast("대기열 준비 실패: " + ex.getMessage()); return;
+        }
+        if (queue.length() == 0) { toast("대기 중인 영상이 없습니다."); return; }
+        Intent command = new Intent(this, ConversionService.class)
+                .setAction(ConversionService.ACTION_START)
+                .putExtra(ConversionService.EXTRA_JOBS, queue.toString())
+                .putExtra(ConversionService.EXTRA_DESTINATION, outputTree.toString());
+        try {
+            if (Build.VERSION.SDK_INT >= 26) startForegroundService(command);
+            else startService(command);
+            stateLabel.setText("백그라운드 작업 시작 중…");
+            startButton.setEnabled(false);
+            stopButton.setEnabled(true);
+        } catch (Exception ex) {
+            toast("백그라운드 시작 실패: " + ex.getMessage());
+        }
     }
     private void startTests() {
-        if (busy) return;
+        if (busy || conversionRunning()) return;
         if (outputTree == null) { toast("먼저 저장 폴더를 선택하세요."); return; }
         final Uri selectedFolder = outputTree;
         startWork(() -> {
@@ -328,7 +369,7 @@ public final class MainActivity extends Activity {
         });
         startButton.setEnabled(false); stopButton.setEnabled(true);
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
-        log("작업 중에는 앱을 화면에 유지하세요. 화면이 꺼지면 Android가 작업을 제한할 수 있습니다.");
+        log("호환성 샘플 복사 중 · 실제 다운로드/변환은 알림을 통해 백그라운드에서 진행됩니다.");
         Thread worker = new Thread(() -> {
             try { task.run(); }
             finally {
