@@ -74,6 +74,14 @@ jobs:
           cp /tmp/em700-qjs-build/qjs app/src/main/jniLibs/arm64-v8a/libqjs.so
           file app/src/main/jniLibs/arm64-v8a/libqjs.so
 
+      - name: Confirm FFmpegKit Smart Exception dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          gradle --no-daemon :app:dependencies --configuration debugRuntimeClasspath > /tmp/em700-debug-deps.txt
+          grep -F 'com.arthenica:smart-exception-java:0.2.1' /tmp/em700-debug-deps.txt
+          grep -F 'com.arthenica:smart-exception-common:0.2.1' /tmp/em700-debug-deps.txt
+
       - name: Compile APK
         run: gradle --no-daemon :app:assembleDebug
 
@@ -104,6 +112,6 @@ jobs:
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: EM700-Mobile-v0.1.9.2-debug-apk
+          name: EM700-Mobile-v0.1.9.3-debug-apk
           path: app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error

@@ -131,7 +131,7 @@ public final class WorkEngine {
 
     private DownloadedInput download(MediaJob job, File workspace) throws Exception {
         progress(job, 0, "yt-dlp 초기화");
-        listener.onLog("EM700 Mobile v0.1.9.2 · 실시간 형식 조회 후 다운로드");
+        listener.onLog("EM700 Mobile v0.1.9.3 · 실시간 형식 조회 후 다운로드");
         if (!ytdlpReady) {
             listener.onLog("yt-dlp 엔진: " + YtDlpUpdater.prepare(context));
             ytdlpReady = true;

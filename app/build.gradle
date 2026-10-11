@@ -10,8 +10,8 @@ android {
         applicationId 'dev.beatbox.em700'
         minSdk 26
         targetSdk 35
-        versionCode 10
-        versionName '0.1.9.2-alpha'
+        versionCode 11
+        versionName '0.1.9.3-alpha'
         ndk {
             abiFilters 'arm64-v8a'
         }
@@ -37,5 +37,9 @@ android {
 
 dependencies {
     implementation 'dev.ffmpegkit-maintained:ffmpeg-kit-full:8.1.7'
+    // ffmpeg-kit-full 8.1.7's POM does not declare its Smart Exception runtime dependency.
+    // Without these, FFmpegKitConfig fails with NoClassDefFoundError on device.
+    implementation 'com.arthenica:smart-exception-java:0.2.1'
+    implementation 'com.arthenica:smart-exception-common:0.2.1'
     implementation 'dev.ffmpegkit-maintained:yt-dlp-android:2.0.2'
 }
