@@ -131,7 +131,7 @@ public final class WorkEngine {
 
     private DownloadedInput download(MediaJob job, File workspace) throws Exception {
         progress(job, 0, "yt-dlp 초기화");
-        listener.onLog("EM700 Mobile v0.1.8 · 실시간 형식 조회 후 다운로드");
+        listener.onLog("EM700 Mobile v0.1.9.2 · 실시간 형식 조회 후 다운로드");
         if (!ytdlpReady) {
             listener.onLog("yt-dlp 엔진: " + YtDlpUpdater.prepare(context));
             ytdlpReady = true;
@@ -145,8 +145,7 @@ public final class WorkEngine {
             listener.onLog("형식 조회 중 · JS/EJS 및 제공 스트림 확인");
             JSONObject report;
             try {
-                String raw = com.chaquo.python.Python.getInstance()
-                        .getModule("em700_format_diagnostic")
+                String raw = YtDlpUpdater.loadHelper(context, "em700_format_diagnostic")
                         .callAttr("plan", job.url, height).toString();
                 report = new JSONObject(raw);
             } catch (Exception ex) {
@@ -231,8 +230,7 @@ public final class WorkEngine {
     private void diagnoseFormats(MediaJob job) {
         listener.onLog("진단: 실제 접근 가능한 영상/음성 형식 확인 중");
         try {
-            String report = com.chaquo.python.Python.getInstance()
-                    .getModule("em700_format_diagnostic")
+            String report = YtDlpUpdater.loadHelper(context, "em700_format_diagnostic")
                     .callAttr("describe", job.url).toString();
             for (String line : report.split("\n")) {
                 if (!line.trim().isEmpty()) listener.onLog("형식 진단: " + shortError(line));

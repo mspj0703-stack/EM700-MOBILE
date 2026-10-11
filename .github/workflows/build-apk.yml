@@ -77,9 +77,33 @@ jobs:
       - name: Compile APK
         run: gradle --no-daemon :app:assembleDebug
 
+      - name: Verify packaged Python helpers
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PYVERIFY'
+          from pathlib import Path
+          from zipfile import ZipFile
+          apk = Path('app/build/outputs/apk/debug/app-debug.apk')
+          required = [
+              'assets/em700_format_diagnostic.py',
+              'assets/em700_playlist.py',
+              'assets/em700_js_bridge.py',
+          ]
+          with ZipFile(apk) as z:
+              for name in required:
+                  try:
+                      content = z.read(name)
+                  except KeyError:
+                      raise SystemExit(f'FATAL: {name} absent from APK')
+                  if len(content) < 100:
+                      raise SystemExit(f'FATAL: {name} empty in APK')
+                  print(f'OK: {name} ({len(content)} bytes)')
+          PYVERIFY
+
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: EM700-Mobile-v0.1.9-debug-apk
+          name: EM700-Mobile-v0.1.9.2-debug-apk
           path: app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error

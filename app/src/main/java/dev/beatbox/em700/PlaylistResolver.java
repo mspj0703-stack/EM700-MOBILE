@@ -3,7 +3,6 @@ package dev.beatbox.em700;
 import android.content.Context;
 import android.net.Uri;
 
-import com.chaquo.python.Python;
 
 import org.json.JSONArray;
 import org.json.JSONObject;
@@ -39,8 +38,7 @@ final class PlaylistResolver {
     static List<MediaJob> resolve(Context context, MediaJob parent) throws Exception {
         if (!parent.playlist || !isPlaylistUrl(parent.url))
             throw new IllegalArgumentException("유효한 YouTube 재생목록 링크가 아닙니다.");
-        YtDlpUpdater.prepare(context);
-        String json = Python.getInstance().getModule("em700_playlist")
+        String json = YtDlpUpdater.loadHelper(context, "em700_playlist")
                 .callAttr("resolve", parent.url).toString();
         JSONObject doc = new JSONObject(json);
         JSONArray items = doc.getJSONArray("entries");

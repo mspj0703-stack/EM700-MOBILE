@@ -70,6 +70,23 @@ final class YtDlpUpdater {
                 while ((n = in.read(buf)) >= 0) out.write(buf, 0, n);
             }
         }
+        // Python API level format inspection (the old -F printout bypasses UI logger).
+        File diagnostic = new File(active, "em700_format_diagnostic.py");
+        try (InputStream in = context.getAssets().open("em700_format_diagnostic.py");
+             FileOutputStream out = new FileOutputStream(diagnostic)) {
+            byte[] buf = new byte[8192];
+            int n;
+            while ((n = in.read(buf)) != -1) out.write(buf, 0, n);
+        }
+        // Playlist extractor lives beside the diagnostic module and uses the same
+        // in-app yt-dlp/QuickJS configuration. Always copy it so APK updates take effect.
+        File playlistHelper = new File(active, "em700_playlist.py");
+        try (InputStream in = context.getAssets().open("em700_playlist.py");
+             FileOutputStream out = new FileOutputStream(playlistHelper)) {
+            byte[] buf = new byte[8192];
+            int n;
+            while ((n = in.read(buf)) != -1) out.write(buf, 0, n);
+        }
         PyObject sysPath = py.getModule("sys").get("path");
         sysPath.callAttr("insert", 0, active.getAbsolutePath());
         String actual = py.getModule("yt_dlp.version").get("__version__").toString();
@@ -80,6 +97,45 @@ final class YtDlpUpdater {
         if (!qjs.exists()) throw new IOException("QuickJS Android 실행 파일이 APK에 없습니다");
         py.getModule("em700_js_bridge").callAttr("configure", qjs.getAbsolutePath());
         return actual + " + QuickJS";
+    }
+
+    /**
+     * Loads app-bundled Python helpers by their verified absolute file path.
+     * A plain Python.getModule(name) relies on sys.path / import caches and can
+     * fail on some upgraded APK installations even when the asset is present.
+     * Only names hard-coded below can be loaded from our private app directory.
+     */
+    static synchronized PyObject loadHelper(Context context, String name) throws Exception {
+        if (!"em700_format_diagnostic".equals(name) && !"em700_playlist".equals(name)) {
+            throw new IllegalArgumentException("허용되지 않는 Python 모듈: " + name);
+        }
+        // Also extracts helpers from assets on existing installations.
+        prepare(context);
+        File active = new File(new File(context.getFilesDir(), "yt_dlp_update"), "python");
+        File script = new File(active, name + ".py");
+        if (!script.isFile() || script.length() == 0) {
+            throw new IOException("APK Python 보조 파일 설치 실패: " + name + ".py");
+        }
+        try {
+            Python python = Python.getInstance();
+            // Resolve the module from its actual file, bypassing sys.path caching.
+            PyObject util = python.getModule("importlib.util");
+            PyObject spec = util.callAttr("spec_from_file_location", name, script.getAbsolutePath());
+            PyObject module = util.callAttr("module_from_spec", spec);
+            // Register before execution, matching Python import semantics.
+            PyObject modules = python.getModule("sys").get("modules");
+            modules.callAttr("__setitem__", name, module);
+            try {
+                spec.get("loader").callAttr("exec_module", module);
+            } catch (Exception error) {
+                modules.callAttr("__delitem__", name);
+                throw error;
+            }
+            return module;
+        } catch (Exception failure) {
+            throw new IOException("Python 모듈 로드 실패 (" + script.getAbsolutePath() + "): "
+                    + failure.getMessage(), failure);
+        }
     }
 
     private static void extract(Context context, File to) throws IOException {

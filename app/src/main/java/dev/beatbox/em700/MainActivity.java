@@ -62,7 +62,7 @@ public final class MainActivity extends Activity {
         if (!last.isEmpty()) outputTree = Uri.parse(last);
         buildUI();
         refreshQueue();
-        log("EM700 Mobile v0.1.9 · 백그라운드 다운로드/변환");
+        log("EM700 Mobile v0.1.9.2 · 백그라운드 다운로드/변환");
         if (Build.VERSION.SDK_INT >= 33 &&
                 checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
             requestPermissions(new String[] { Manifest.permission.POST_NOTIFICATIONS }, 140);
